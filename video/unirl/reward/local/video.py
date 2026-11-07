@@ -1,0 +1,172 @@
+"""Video reward scorer."""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+from dataclasses import dataclass
+from typing import List
+
+import torch
+from PIL import Image
+
+from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
+from unirl.types.reward import RewardRequest, RewardResponse
+
+from .registry import (
+    resolve_builtin_reward_scorer_class,
+    resolve_builtin_reward_spec_class,
+)
+
+
+class VideoRewardScorer(RewardBackend):
+    """Specialized reward scorer for video generation."""
+
+    input_kind = "video"
+
+    def __init__(self, *, config: "VideoSpec", base_device: str) -> None:
+        inner_model = str(config.inner_model_name).strip().lower()
+        super().__init__(
+            model_name=inner_model,
+            batch_size=config.batch_size,
+        )
+        self.temporal_weight = config.temporal_weight
+        self.alignment_weight = config.alignment_weight
+        self.sample_frames = config.sample_frames
+        self.return_embeddings = config.return_embeddings
+
+        inner_scorer_cls = resolve_builtin_reward_scorer_class(inner_model)
+        inner_spec_cls = resolve_builtin_reward_spec_class(inner_model)
+        inner_spec = inner_spec_cls()
+        overrides = {
+            field_name: getattr(config, field_name)
+            for field_name in ("device", "batch_size", "prompt_source")
+            if hasattr(inner_spec, field_name)
+        }
+        if overrides:
+            inner_spec = dataclasses.replace(inner_spec, **overrides)
+        self.frame_scorer = inner_scorer_cls(config=inner_spec, base_device=base_device)
+
+    def compute_rewards(self, request: RewardRequest) -> RewardResponse:
+        if not request.is_video:
+            return self.frame_scorer.compute_rewards(request)
+
+        start = time.time()
+        videos = request.videos
+
+        try:
+            from torchvision.transforms.functional import to_tensor
+
+            from unirl.types.primitives import Images, Texts
+
+            rewards = []
+            component_rewards = {
+                "alignment": [],
+                "temporal": [],
+            }
+            video_embs = []
+
+            for index, video in enumerate(videos):
+                frames = self._sample_frames(video)
+                frame_pixels = torch.stack([to_tensor(f) for f in frames])
+                original = (
+                    None
+                    if request.original_prompt is None
+                    else Texts(texts=[request.original_prompt.texts[index]] * len(frames))
+                )
+                generation = (
+                    None
+                    if request.generation_prompt is None
+                    else Texts(texts=[request.generation_prompt.texts[index]] * len(frames))
+                )
+                frame_request = RewardRequest(
+                    generated={"image": Images.from_dense(frame_pixels)},
+                    original_prompt=original,
+                    generation_prompt=generation,
+                )
+                frame_response = self.frame_scorer.compute_rewards(frame_request)
+                if self.return_embeddings:
+                    frame_embs = getattr(self.frame_scorer, "last_image_embs", None)
+                    if frame_embs is None:
+                        raise RuntimeError(f"{type(self.frame_scorer).__name__} exposes no last_image_embs for PEC")
+                    video_embs.append(frame_embs.mean(dim=0).tolist())
+                alignment_reward = sum(frame_response.rewards) / len(frame_response.rewards)
+                temporal_reward = self._compute_temporal_consistency(video)
+                total_reward = self.alignment_weight * alignment_reward + self.temporal_weight * temporal_reward
+
+                rewards.append(total_reward)
+                component_rewards["alignment"].append(alignment_reward)
+                component_rewards["temporal"].append(temporal_reward)
+
+            if self.return_embeddings:
+                from unirl.algorithms.pec import PEC_EMB_KEY
+
+                component_rewards[PEC_EMB_KEY] = video_embs
+            return RewardResponse(
+                rewards=rewards,
+                component_rewards=component_rewards,
+                successes=[True] * len(rewards),
+                errors=[None] * len(rewards),
+                compute_time=time.time() - start,
+            )
+        except Exception as e:
+            return RewardResponse(
+                rewards=[0.0] * len(videos),
+                successes=[False] * len(videos),
+                errors=[str(e)] * len(videos),
+                compute_time=time.time() - start,
+            )
+
+    def _sample_frames(self, video: torch.Tensor) -> List[Image.Image]:
+        from torchvision.transforms.functional import to_pil_image
+
+        if video.dim() == 4:
+            video = video.permute(1, 0, 2, 3)
+        elif video.dim() == 5:
+            video = video.squeeze(0).permute(1, 0, 2, 3)
+
+        num_frames = video.shape[0]
+        indices = torch.linspace(0, num_frames - 1, self.sample_frames).long()
+
+        frames = []
+        for idx in indices:
+            frame = video[idx]
+            if frame.max() <= 1.0:
+                frame = (frame * 255).byte()
+            frames.append(to_pil_image(frame))
+
+        return frames
+
+    def _compute_temporal_consistency(self, video: torch.Tensor) -> float:
+        if video.dim() == 4:
+            video = video.permute(1, 0, 2, 3)
+        elif video.dim() == 5:
+            video = video.squeeze(0).permute(1, 0, 2, 3)
+
+        if len(video) <= 1:
+            return 1.0
+        avg_diff = float((video[:-1].float() - video[1:].float()).abs().mean().item())
+        return max(0.0, 1.0 - avg_diff)
+
+    def offload(self) -> None:
+        self.frame_scorer.offload()
+
+    def onload(self) -> None:
+        self.frame_scorer.onload()
+
+    def dispose(self) -> None:
+        self.frame_scorer.dispose()
+
+
+@dataclass
+class VideoSpec(PromptRewardComponentSpec):
+    """Typed config for the Video reward component."""
+
+    batch_size: int = 8
+    device: str = "auto"
+    inner_model_name: str = "pickscore"
+    temporal_weight: float = 0.3
+    alignment_weight: float = 0.7
+    sample_frames: int = 8
+    # Ship the frame-averaged reward-model embedding per video (PEC perceptual entropy).
+    return_embeddings: bool = False

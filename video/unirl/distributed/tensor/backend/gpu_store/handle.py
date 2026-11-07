@@ -1,0 +1,104 @@
+"""GPUTensorHandle — tensor reference for the Single Controller."""
+
+from __future__ import annotations
+
+import logging
+import weakref
+
+import ray
+import torch
+from torch import Tensor
+
+logger = logging.getLogger(__name__)
+
+
+class GPUTensorHandle:
+    """Handle to a single tensor stored in a worker."""
+
+    __slots__ = (
+        "store_key",
+        "source_id",
+        "shape",
+        "dtype",
+        "device",
+        "worker_handle",
+        "_finalized",
+        "__weakref__",
+        "object_ref",
+    )
+
+    def __init__(self, store_key: str, source_id, shape: tuple, dtype: torch.dtype, device: str, object_ref=None):
+        self.store_key = store_key
+        self.source_id = source_id
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+        self.worker_handle = None
+        self._finalized = False
+        self.object_ref = object_ref  # Ray ObjectRef for CPU tensors in plasma store
+
+    def rebind(self, worker_handle) -> None:
+        """Attach worker actor handle and register release finalizer."""
+        assert not self._finalized, (
+            f"GPUTensorHandle {self.store_key!r} is already bound. rebind() must only be called once."
+        )
+        self._finalized = True
+        self.worker_handle = worker_handle
+        if self.object_ref is None:
+            weakref.finalize(self, GPUTensorHandle._release, worker_handle, self.store_key)
+
+    def local(self) -> Tensor:
+        """Fetch the actual tensor to controller CPU."""
+        if self.object_ref is not None:
+            return ray.get(self.object_ref)
+        assert self.worker_handle is not None, "GPUTensorHandle not bound to worker"
+        return ray.get(self.worker_handle.transport_op.remote("get_cpu", self))
+
+    def __copy__(self) -> GPUTensorHandle:
+        if self.worker_handle is not None and self.object_ref is None:
+            self.worker_handle.transport_op.remote("incref", self.store_key)
+        clone = GPUTensorHandle(
+            self.store_key, self.source_id, self.shape, self.dtype, self.device, object_ref=self.object_ref
+        )
+        if self.worker_handle is not None:
+            clone.rebind(self.worker_handle)
+        return clone
+
+    def __deepcopy__(self, memo) -> GPUTensorHandle:
+        clone = self.__copy__()
+        memo[id(self)] = clone
+        return clone
+
+    def __getstate__(self) -> dict:
+        return {
+            "store_key": self.store_key,
+            "source_id": self.source_id,
+            "shape": self.shape,
+            "dtype": self.dtype,
+            "device": self.device,
+            "object_ref": self.object_ref,
+        }
+
+    def __setstate__(self, state: dict) -> None:
+        self.store_key = state["store_key"]
+        self.source_id = state["source_id"]
+        self.shape = state["shape"]
+        self.dtype = state["dtype"]
+        self.device = state["device"]
+        self.worker_handle = None
+        self._finalized = False
+        self.object_ref = state.get("object_ref")  # None for CUDA handles
+
+    @staticmethod
+    def _release(worker_handle, store_key: str) -> None:
+        """GC callback: tell the worker to decref this tensor."""
+        try:
+            if not ray.is_initialized():
+                return
+            worker_handle.transport_op.remote("decref", store_key)
+        except Exception:
+            logger.debug("Failed to release remote tensor %s.", store_key, exc_info=True)
+
+    def __repr__(self) -> str:
+        bound = "bound" if self.worker_handle else "unbound"
+        return f"GPUTensorHandle({self.shape}, {self.dtype}, source_id={self.source_id}, {bound})"

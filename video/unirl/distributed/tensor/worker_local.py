@@ -1,0 +1,111 @@
+"""WorkerLocalTransport — worker-resident transports + the ``localize`` routing."""
+
+from __future__ import annotations
+
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
+
+import ray
+import torch
+
+from unirl.distributed.tensor.ref import TensorRef, TensorSpan, map_tree
+from unirl.distributed.tensor.transport import TensorTransport
+from unirl.distributed.utils import collect_leaves
+
+
+class WorkerLocalTransport(TensorTransport):
+    """Worker-resident transport: ref-count lifecycle, cross-worker NCCL, and ``localize``."""
+
+    REMOTE_OPS: ClassVar[frozenset] = frozenset({"incref", "decref", "get_cpu", "nccl_send", "nccl_recv"})
+
+    def incref(self, key: Any) -> None:
+        """Increment the ref count. No-op by default."""
+
+    def decref(self, key: Any) -> None:
+        """Decrement the ref count; free at zero. No-op by default."""
+
+    def setup_transfer(self, global_rank: int, world_size: int) -> None:
+        """Initialize the cross-worker transfer group."""
+
+    def nccl_send(self, dst_rank: int, spans: List[TensorSpan]) -> None:
+        raise NotImplementedError("transport does not support cross-worker send")
+
+    def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:
+        raise NotImplementedError("transport does not support cross-worker recv")
+
+    @classmethod
+    def _is_local(cls, ref: Any, dst_worker_id: str, dst_device_id: int, pool: Any) -> bool:
+        """Per-backend locality predicate. Base: local iff produced by the dst worker."""
+        return ref.source_id == dst_worker_id
+
+    @classmethod
+    def _move_key(cls, span: Any, dst: Tuple[str, int], pool: Any) -> Optional[tuple]:
+        """A span's transfer identity wrt ``dst``, or ``None`` if already resolvable there."""
+        dst_worker_id, dst_device_id = dst
+        h = span.handle
+        if h.object_ref is not None:
+            return None
+        if cls._is_local(h, dst_worker_id, dst_device_id, pool):
+            return None
+        return (pool.device_id_of(h.source_id), dst_device_id, h.store_key, span.start, span.stop)
+
+    @classmethod
+    def _replace_leaf(cls, moved: Dict[tuple, Any], dst: Tuple[str, int], pool: Any) -> Callable[[Any], Any]:
+        """``map_tree`` leaf for REPLACE: swap foreign spans for their moved result."""
+
+        def leaf(o: Any) -> Any:
+            if isinstance(o, TensorRef):
+                new_spans = [moved.get(cls._move_key(s, dst, pool), s) for s in o.spans]
+                if all(ns is s for ns, s in zip(new_spans, o.spans)):
+                    return o
+                return o.with_spans(new_spans)
+            return o
+
+        return leaf
+
+    @classmethod
+    def _move(cls, pool: Any, to_move: Dict[tuple, Any]) -> Dict[tuple, Any]:
+        """One batched NCCL hop per ``(src, dst)`` device group; return key → received span."""
+        groups: Dict[Tuple[int, int], List[tuple]] = {}
+        for key in to_move:
+            groups.setdefault((key[0], key[1]), []).append(key)
+
+        moved: Dict[tuple, Any] = {}
+        for src_device_id, dst_device_id in sorted(groups):
+            keys = groups[(src_device_id, dst_device_id)]
+            spans = [to_move[k] for k in keys]
+            dst_worker = pool.slot0_worker(dst_device_id)
+            recv_ref = dst_worker.transport_op.remote(
+                "nccl_recv", src_device_id, [s.shape for s in spans], [s.dtype for s in spans]
+            )
+            send_ref = pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, spans)
+            new_handles, _ = ray.get([recv_ref, send_ref])
+
+            for key, new_h in zip(keys, new_handles):
+                new_h.rebind(dst_worker)
+                moved[key] = TensorSpan(new_h, 0, int(new_h.shape[0]))
+        return moved
+
+    @classmethod
+    def localize(cls, shards: list, pool: Any, device_ids: List[int], worker_ids: List[str]) -> list:
+        """Make every ref resolvable on its dst worker — FIND (pure) / MOVE (NCCL) / REPLACE (pure)."""
+        dsts = list(zip(worker_ids, device_ids))
+
+        to_move: Dict[tuple, Any] = {}
+        for shard, dst in zip(shards, dsts):
+            for ref in collect_leaves(shard, TensorRef):
+                for s in ref.spans:
+                    key = cls._move_key(s, dst, pool)
+                    if key is not None:
+                        to_move.setdefault(key, s)
+        if not to_move:
+            return shards
+
+        moved = cls._move(pool, to_move)
+        return [map_tree(shard, cls._replace_leaf(moved, dst, pool)) for shard, dst in zip(shards, dsts)]
+
+    def get_cpu(self, handle: Any) -> torch.Tensor:
+        """Return the stored tensor as a CPU tensor."""
+        return self._resolve_handles([handle])[0].cpu()
+
+
+__all__ = ["WorkerLocalTransport"]

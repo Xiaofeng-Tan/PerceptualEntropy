@@ -1,0 +1,262 @@
+"""EMA feature: shadow structure injection + runtime shadow updates."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
+from typing import Callable, Iterator, List, Optional, Tuple
+
+import torch
+from torch import Tensor, nn
+from torch.nn.parameter import Parameter
+
+from unirl.distributed.local import local_view
+from unirl.models.types.post_materialize import defer_after_materialize
+from unirl.train.configs import EmaFullConfig, EmaLoraConfig
+from unirl.train.lora import (
+    ModuleSelection,
+    _activate,
+    _reset_adapter,
+    _set_adapter_requires_grad,
+    normalize_module_selection,
+    normalize_optional_module_selection,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Shadow:
+    """How to access (live, shadow) parameter pairs on the model tree."""
+
+    iter_pairs: Callable[[], Iterator[Tuple[Tensor, Tensor]]]
+    swap_in: Callable[[], None]
+    swap_out: Callable[[], None]
+
+
+@dataclass
+class EMA:
+    """Per-step shadow updater.  The only runtime class."""
+
+    shadow: Shadow
+    decay_fn: Callable[[int], float]
+    timing: str
+    name: str = "ema"
+
+    def step(self, t: int) -> None:
+        if self.timing == "optimizer_step":
+            self._run(self.decay_fn(t))
+
+    def on_rollout_end(self, t: int) -> None:
+        if self.timing == "rollout_end":
+            self._run(self.decay_fn(t))
+
+    @torch.no_grad()
+    def _run(self, decay: float) -> None:
+        if decay <= 0.0:
+            for live, shd in self.shadow.iter_pairs():
+                local_view(shd).copy_(local_view(live))
+            return
+        for live, shd in self.shadow.iter_pairs():
+            local_shd = local_view(shd)
+            local_shd.mul_(decay).add_(local_view(live), alpha=1.0 - decay)
+
+    @contextmanager
+    def use_shadow(self):
+        """Swap shadow into live position for inference / export."""
+        self.shadow.swap_in()
+        try:
+            yield
+        finally:
+            self.shadow.swap_out()
+
+    def apply_shadow(self) -> None:
+        """RPC-friendly swap-in (no context manager). Must be paired with"""
+        self.shadow.swap_in()
+
+    def restore_shadow(self) -> None:
+        """RPC-friendly swap-out (restore live params after :meth:`apply_shadow`)."""
+        self.shadow.swap_out()
+
+
+def make_decay_fn(cfg: EmaLoraConfig | EmaFullConfig) -> Callable[[int], float]:
+    """Build a ``t -> decay`` callable from an EMA config."""
+    if isinstance(cfg, EmaFullConfig):
+        target = float(cfg.target_decay)
+        return lambda t: min((1 + t) / (10 + t), target)
+
+    decay_type = str(cfg.ema_decay_type)
+    ema_decay = float(cfg.ema_decay)
+    flat_steps = int(cfg.ema_flat_steps)
+    uprate = float(cfg.ema_uprate)
+    uphold = float(cfg.ema_uphold)
+
+    if decay_type == "linear":
+        return lambda t: float(min(t * uprate, uphold))
+    if decay_type == "warmup":
+        return lambda t: 0.0 if t < flat_steps else float(min((t - flat_steps) * uprate, uphold))
+    return lambda t: ema_decay
+
+
+def inject_nft(
+    model: nn.Module,
+    *,
+    rank: int,
+    alpha: int,
+    target_modules: ModuleSelection,
+    exclude_modules: Optional[ModuleSelection] = None,
+    default: str = "default",
+    shadow: str = "old",
+    dropout: float = 0.0,
+    bias: str = "none",
+    task_type: str = "FEATURE_EXTRACTION",
+) -> Shadow:
+    """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
+    from peft import LoraConfig, inject_adapter_in_model
+
+    if bias != "none":
+        raise ValueError(
+            f"inject_nft: bias must be 'none', got {bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported."
+        )
+    peft_cfg = LoraConfig(
+        r=int(rank),
+        lora_alpha=int(alpha),
+        lora_dropout=float(dropout),
+        target_modules=normalize_module_selection(target_modules),
+        exclude_modules=normalize_optional_module_selection(exclude_modules),
+        bias=str(bias),
+        task_type=str(task_type),
+    )
+    inject_adapter_in_model(peft_cfg, model, adapter_name=default)
+    inject_adapter_in_model(peft_cfg, model, adapter_name=shadow)
+
+    if hasattr(model, "_hf_peft_config_loaded"):
+        model._hf_peft_config_loaded = True
+    _activate_keep_grad(model, default, trainable=default, frozen=shadow)
+
+    if _current_rank() == 0:
+        n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        logger.info(
+            "inject_nft: adapters %r + %r (rank=%d, alpha=%d) — %d trainable params",
+            default,
+            shadow,
+            rank,
+            alpha,
+            n_trainable,
+        )
+
+    defer_after_materialize(model, partial(_reset_adapter, name=default))
+    defer_after_materialize(model, partial(_reset_adapter, name=shadow))
+    defer_after_materialize(model, partial(_copy_adapter, src=default, dst=shadow))
+
+    return Shadow(
+        iter_pairs=lambda: _adapter_pairs(model, default, shadow),
+        swap_in=lambda: _activate_keep_grad(model, shadow, trainable=default, frozen=shadow),
+        swap_out=lambda: _activate_keep_grad(model, default, trainable=default, frozen=shadow),
+    )
+
+
+def inject_mirror(
+    model: nn.Module,
+    *,
+    prefix: str = "shadow_",
+) -> Shadow:
+    """Register shadow_* parameters for full-model EMA.  Returns Shadow."""
+    pairs: List[Tuple[nn.Module, str, str]] = []
+
+    for fqn, p in list(model.named_parameters()):
+        if not p.requires_grad:
+            continue
+        parent, attr = _parent_and_attr(model, fqn)
+        shadow_attr = prefix + attr
+        shadow_param = Parameter(torch.empty_like(p), requires_grad=False)
+        parent.register_parameter(shadow_attr, shadow_param)
+        pairs.append((parent, attr, shadow_attr))
+
+    if _current_rank() == 0:
+        logger.info("inject_mirror: registered %d shadow parameters (prefix=%r)", len(pairs), prefix)
+
+    defer_after_materialize(model, partial(_copy_mirror, pairs=pairs))
+
+    return Shadow(
+        iter_pairs=lambda: ((getattr(m, a), getattr(m, s)) for m, a, s in pairs),
+        swap_in=lambda: _swap_mirror(pairs),
+        swap_out=lambda: _swap_mirror(pairs),
+    )
+
+
+def _copy_adapter(model: nn.Module, *, src: str, dst: str) -> None:
+    from peft.tuners.lora import LoraLayer
+
+    n_copied = 0
+    for m in model.modules():
+        if not isinstance(m, LoraLayer):
+            continue
+        for bank in (m.lora_A, m.lora_B):
+            if src in bank and dst in bank:
+                for sp, dp in zip(bank[src].parameters(), bank[dst].parameters()):
+                    dp.data.copy_(sp.data)
+                n_copied += 1
+    if n_copied == 0:
+        raise RuntimeError(f"_copy_adapter: no adapter pairs found for {src!r} -> {dst!r}")
+
+
+def _adapter_pairs(
+    model: nn.Module,
+    default: str,
+    shadow: str,
+) -> list[Tuple[torch.Tensor, torch.Tensor]]:
+    from peft.tuners.lora import LoraLayer
+
+    pairs: list[Tuple[torch.Tensor, torch.Tensor]] = []
+    for m in model.modules():
+        if not isinstance(m, LoraLayer):
+            continue
+        for bank in (m.lora_A, m.lora_B):
+            if default in bank and shadow in bank:
+                for sp, dp in zip(bank[default].parameters(), bank[shadow].parameters()):
+                    pairs.append((sp, dp))
+    return pairs
+
+
+def _activate_keep_grad(model: nn.Module, active: str, *, trainable: str, frozen: str) -> None:
+    """Switch the active adapter, then RESTORE the canonical requires_grad split."""
+    _activate(model, active)
+    _set_adapter_requires_grad(model, trainable, True)
+    _set_adapter_requires_grad(model, frozen, False)
+
+
+def _copy_mirror(model: nn.Module, *, pairs: List[Tuple[nn.Module, str, str]]) -> None:
+    for mod, live_attr, shadow_attr in pairs:
+        getattr(mod, shadow_attr).data.copy_(getattr(mod, live_attr).data)
+
+
+def _swap_mirror(pairs: List[Tuple[nn.Module, str, str]]) -> None:
+    for mod, live_attr, shadow_attr in pairs:
+        live = getattr(mod, live_attr)
+        shd = getattr(mod, shadow_attr)
+        live.data, shd.data = shd.data, live.data
+
+
+def _parent_and_attr(model: nn.Module, fqn: str) -> Tuple[nn.Module, str]:
+    parts = fqn.rsplit(".", 1)
+    if len(parts) == 1:
+        return model, parts[0]
+    parent = model
+    for part in parts[0].split("."):
+        parent = getattr(parent, part)
+    return parent, parts[1]
+
+
+def _current_rank() -> int:
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    return 0
+
+
+__all__ = ["EMA", "make_decay_fn", "Shadow", "inject_nft", "inject_mirror"]

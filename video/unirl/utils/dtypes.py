@@ -1,0 +1,57 @@
+"""Small dtype helpers shared across config-driven runtime components."""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+import torch
+
+_DTYPE_ALIASES = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "float": torch.float32,
+}
+
+_CANONICAL_DTYPE_NAMES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
+
+def parse_torch_dtype(
+    value: Any,
+    *,
+    field_name: str = "dtype",
+    allow_none: bool = False,
+    allow_auto: bool = False,
+) -> Optional[torch.dtype]:
+    """Normalize a string-ish dtype name to ``torch.dtype``."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{field_name} must not be None.")
+    if isinstance(value, torch.dtype):
+        return value
+
+    key = str(value).strip().lower()
+    if allow_auto and key == "auto":
+        return None
+    if key in _DTYPE_ALIASES:
+        return _DTYPE_ALIASES[key]
+
+    valid = "bf16/fp16/fp32" + ("/auto" if allow_auto else "")
+    raise ValueError(f"Unsupported {field_name}={value!r}. Use one of {valid}.")
+
+
+def canonical_torch_dtype_name(dtype: torch.dtype, *, field_name: str = "dtype") -> str:
+    """Return the canonical PyTorch attribute name for a supported dtype."""
+    name = _CANONICAL_DTYPE_NAMES.get(dtype)
+    if name is None:
+        raise ValueError(f"Unsupported {field_name}={dtype!r}; expected bf16/fp16/fp32.")
+    return name

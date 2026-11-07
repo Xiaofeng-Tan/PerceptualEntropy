@@ -1,0 +1,11 @@
+# Plain DDP, as in the 8x H20 reference runs (that environment had no deepspeed installed).
+# num_machines / num_processes / machine_rank / main_process_ip are given on the command line.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+gpu_ids: all
+main_training_function: main
+mixed_precision: bf16
+rdzv_backend: static
+same_network: true
+use_cpu: false

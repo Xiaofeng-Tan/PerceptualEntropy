@@ -1,0 +1,57 @@
+"""build_transport — construct the per-Worker TensorTransport for a backend kind."""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from unirl.distributed.tensor.transport import TensorTransport
+
+
+def build_transport(
+    kind: str,
+    *,
+    worker_id: str,
+    device: str,
+    device_id: int,
+    tw: Any = None,
+    tq_handoff: Optional[dict] = None,
+    global_rank: Optional[int] = None,
+    world_size: int = 1,
+) -> TensorTransport:
+    """Build the transport for ``kind``."""
+    if kind in ("colocate_store", "colocate"):
+        from unirl.distributed.tensor.backend.colocate_store.store import TensorStore
+        from unirl.distributed.tensor.backend.colocate_store.transport import ColocateStoreTransport
+
+        store = TensorStore(worker_id, device, global_rank, world_size)
+        return ColocateStoreTransport(store)
+
+    if kind in ("gpu_store", "gpu"):
+        from unirl.distributed.tensor.backend.gpu_store.transport import GPUStoreTransport
+
+        if tw is None:
+            raise RuntimeError(
+                "gpu_store transport requires a TensorWorker handle (tw); "
+                "DevicePool must create and inject one per GPU before build_transport."
+            )
+        return GPUStoreTransport(worker_id=worker_id, device_id=device_id, device=device, tw=tw)
+
+    if kind in ("transfer_queue", "tq"):
+        from unirl.distributed.tensor.backend.transfer_queue.runtime import (
+            _DEFAULT_PARTITION_ID,
+            TransferQueueRuntime,
+        )
+        from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
+
+        if tq_handoff is None:
+            raise RuntimeError(
+                "transfer_queue transport requires tq_handoff (the driver's TransferQueueRuntime.init() actor handoff)."
+            )
+        runtime = TransferQueueRuntime().install()
+        runtime.create_client("Worker", tq_handoff)
+        return TQTransport(runtime, partition_id=_DEFAULT_PARTITION_ID)
+
+    raise ValueError(f"unknown transport kind {kind!r}")
+
+
+__all__ = ["build_transport"]

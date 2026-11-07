@@ -1,0 +1,181 @@
+# @package _global_
+# GRPO WAN 2.1 T2V-1.3B trainside (FSDP) colocate, 1x8 A100-40G, local checkpoint/reward paths.
+# Derived from wan21_t2v.yaml.
+#
+# Video FlowGRPO: same trainside shape as sd3_trainside but the WAN 2.1
+# T2V pipeline (3D VAE, UMT5 text encoder) + video_pickscore reward.
+#
+# LoRA targets: v1's recipe inherited the generic `q_proj/k_proj/...` default,
+# which matches NOTHING in the WAN transformer (its attn modules are
+# `attn1.to_q` etc.) — i.e. v1 injected zero adapters. This recipe uses the
+# correct WAN attention targets. Verify on first GPU smoke that
+# `[n for n,p in model.named_parameters() if p.requires_grad]` is non-empty.
+#
+# Data: uses DefaultDataSource (built-in prompts) for out-of-box runs. v1 read
+# a prompt dataset via MultimodalRLDataSource + DATA_PATH; swap the data_source
+# block if you want those prompts.
+# num_updates_per_batch=2 restored (v2 TrainStack multi-update).
+
+num_devices: 8                # 1 node x 8 GPUs
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 1000
+save_interval: 10
+
+# Eval protocol copied from DanceGRPO's distributed_eval (train_grpo_hunyuan.py:318):
+# a fixed prompt file, k=8 samples per prompt, more steps and higher guidance than
+# rollout, and deterministic Euler sampling (eta=0). Resolution/frames stay at the
+# training values, as DanceGRPO also evaluates at its own training geometry.
+# DanceGRPO uses 100 prompts; 95 is the largest count that fits dp=95 prompt scatter.
+eval_interval: 10
+eval_num_prompts: 95
+eval_chunk_prompts: 95
+eval_samples_per_prompt: 8
+eval_eta: 0.0
+eval_sampling:
+  num_inference_steps: 30
+  guidance_scale: 6.0
+save_dir: ${oc.env:SAVE_DIR,saves/wan21_ff_percec}
+
+bundle:
+  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  config:
+    _target_: unirl.models.wan21.config.WAN21PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,???}
+    model_precision: bf16
+    shift: 3.0
+    max_sequence_length: 512
+
+pipeline:
+  _target_: unirl.models.wan21.pipeline.WAN21Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000               # v1 constant_1k
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # WAN transformer attention (self attn1 + cross attn2). v1's generic
+    # q_proj/k_proj default matched nothing here.
+    target_modules:
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 4           # v1 rollout.plan.forward_batch_size (720p caps activation)
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    # Whole-clip reward: PickScore averaged over `sample_frames` frames plus a
+    # temporal-consistency term, instead of VideoPickScoreScorer's single frame.
+    # Inner PickScore resolves its HF ids from the local HF_HOME cache
+    # (HF_HUB_OFFLINE=1); VideoSpec exposes no model-path override.
+    _target_: unirl.reward.local.video.VideoRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video.VideoSpec
+      batch_size: 8
+      device: auto
+      inner_model_name: pickscore
+      sample_frames: 5              # = num_frames; linspace would otherwise repeat indices
+      alignment_weight: 0.7
+      temporal_weight: 0.3
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.wan21.conditions.WAN21Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+  shuffle_updates: true
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:TRAIN_PROMPTS,data/video_prompts.txt}       # DanceGRPO train prompts (50k, action-bearing)
+      eval_data_path: ${oc.env:EVAL_PROMPTS,data/prompts100.txt}  # DanceGRPO fixed eval set (100)
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10         # Flow-Factory wan21 GRPO
+  guidance_scale: 5.0             # Flow-Factory (1.0 = no CFG -> grey collapse)
+  height: 256
+  width: 256                      # Flow-Factory resolution: 256
+  num_frames: 5                   # wan21_720p preset; (num_frames-1)%4==0 required
+  eta: 0.9                        # Flow-Factory noise_level: 0.9
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.3]   # Flow-Factory sde_steps [1,2,3] of 10 steps
+    num_sde_steps: 1                # Flow-Factory num_sde_steps: 1
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan21_t2v_1p3b}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["wan21", "t2v", "grpo", "video", "pickscore", "v2"]
+  # Video media logging is not wired in the minimal v2 trainer's media preview;
+  # keep off to avoid a logging-path error. Metrics still log.
+  log_media: false
+  media_max_items: 8
+  media_log_interval: 1
